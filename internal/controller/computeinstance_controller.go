@@ -24,11 +24,9 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/tools/events"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -48,22 +46,28 @@ import (
 )
 
 const (
+	// DefaultMaxJobHistory is the default number of jobs to keep in status.jobs array
+	DefaultMaxJobHistory = 10
+
+	// DefaultStatusPollInterval is the default interval for polling provider job status
+	DefaultStatusPollInterval = 30 * time.Second
+
 	// defaultPreconditionRequeueInterval is the requeue delay when a precondition for
 	// reconciliation is not yet met (e.g. parent resource not found, configuration
 	// not populated, or dependent resource not in a ready state)
 	defaultPreconditionRequeueInterval = 10 * time.Second
 )
 
-// errSubnetNotFound is returned when the Subnet CR referenced by SubnetRef
-// does not exist. handleUpdate treats this as a transient error and requeues
-// with a fixed delay instead of exponential backoff.
+// errSubnetNotFound is returned when the Subnet CR referenced by the primary
+// subnet (spec.subnetRef or the first networkAttachments entry) does not exist.
+// handleUpdate treats this as a transient error and requeues with a fixed delay
+// instead of exponential backoff.
 var errSubnetNotFound = errors.New("subnet CR not found")
 
 // ComputeInstanceReconciler reconciles a ComputeInstance object
 type ComputeInstanceReconciler struct {
 	client.Client
 	Scheme                   *runtime.Scheme
-	Recorder                 events.EventRecorder
 	mgr                      mcmanager.Manager
 	ComputeInstanceNamespace string
 	TenantNamespace          string
@@ -84,26 +88,22 @@ func NewComputeInstanceReconciler(
 	maxJobHistory int,
 	targetCluster mc.ClusterName,
 ) *ComputeInstanceReconciler {
-	if mgr == nil {
-		panic("mgr must not be nil")
-	}
 
 	if computeInstanceNamespace == "" {
 		computeInstanceNamespace = defaultComputeInstanceNamespace
 	}
 
-	if statusPollInterval <= 0 {
-		statusPollInterval = provisioning.DefaultStatusPollInterval
+	if statusPollInterval == 0 {
+		statusPollInterval = 30 * time.Second
 	}
 
 	if maxJobHistory <= 0 {
-		maxJobHistory = provisioning.DefaultMaxJobHistory
+		maxJobHistory = DefaultMaxJobHistory
 	}
 
 	return &ComputeInstanceReconciler{
 		Client:                   mgr.GetLocalManager().GetClient(),
 		Scheme:                   mgr.GetLocalManager().GetScheme(),
-		Recorder:                 mgr.GetLocalManager().GetEventRecorder(computeInstanceControllerName),
 		mgr:                      mgr,
 		ComputeInstanceNamespace: computeInstanceNamespace,
 		TenantNamespace:          tenantNamespace,
@@ -119,7 +119,6 @@ func NewComputeInstanceReconciler(
 // +kubebuilder:rbac:groups=osac.openshift.io,resources=computeinstances/finalizers,verbs=update
 // +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=kubevirt.io,resources=virtualmachines;virtualmachineinstances,verbs=get;list;watch;delete
-// +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -326,8 +325,8 @@ func (r *ComputeInstanceReconciler) mapTenantToComputeInstances(ctx context.Cont
 }
 
 // handleProvisioning manages the provisioning job lifecycle for a ComputeInstance.
-// Uses shared RunProvisioningLifecycle with statusFlush to prevent duplicate jobs
-// from concurrent reconciliations.
+// It triggers provisioning if needed and polls job status until completion.
+// Status updates are handled by the main reconcile loop.
 func (r *ComputeInstanceReconciler) handleProvisioning(ctx context.Context, instance *v1alpha1.ComputeInstance) (ctrl.Result, error) {
 	log := ctrllog.FromContext(ctx)
 
@@ -344,10 +343,24 @@ func (r *ComputeInstanceReconciler) handleProvisioning(ctx context.Context, inst
 		return ctrl.Result{}, nil
 	}
 
-	return provisioning.RunProvisioningLifecycle(ctx, r.ProvisioningProvider, instance,
-		r.provisionState(instance),
-		r.MaxJobHistory, r.StatusPollInterval,
-		&provisioning.PollCallbacks{
+	provState := r.provisionState(instance)
+	action, latestProvisionJob := r.shouldTriggerProvision(ctx, instance)
+	trigger := func() (ctrl.Result, error) {
+		return provisioning.TriggerJob(ctx, r.ProvisioningProvider, instance, provState, r.MaxJobHistory, r.StatusPollInterval)
+	}
+
+	switch action {
+	case provisioning.Skip:
+		return ctrl.Result{}, nil
+	case provisioning.Trigger:
+		return trigger()
+	case provisioning.Requeue:
+		// Use RequeueAfter (not Requeue: true) to avoid hammering the API server
+		return ctrl.Result{RequeueAfter: r.StatusPollInterval}, nil
+	case provisioning.Backoff:
+		return provisioning.HandleBackoff(ctx, provState, latestProvisionJob, trigger)
+	default: // provisioning.Poll
+		return provisioning.PollJob(ctx, r.ProvisioningProvider, instance, provState, latestProvisionJob, r.StatusPollInterval, &provisioning.PollCallbacks{
 			OnFailed: func(_ string) {
 				// Only set Failed phase if no VM exists yet (first-time provisioning failure).
 				// If the VM already exists (re-provisioning failure), the phase is driven by KubeVirt
@@ -359,17 +372,10 @@ func (r *ComputeInstanceReconciler) handleProvisioning(ctx context.Context, inst
 			IsCompleted: func() bool {
 				// EDA's GetProvisionStatus always returns Unknown.
 				// Detect completion by checking if the VM was created on the cluster.
-				latestJob := provisioning.FindLatestJobByType(instance.Status.Jobs, v1alpha1.JobTypeProvision)
-				return latestJob != nil && provisioning.IsEDAJobID(latestJob.JobID) && instance.Status.VirtualMachineReference != nil
+				return provisioning.IsEDAJobID(latestProvisionJob.JobID) && instance.Status.VirtualMachineReference != nil
 			},
-		},
-		func() bool {
-			return provisioning.CheckAPIServerForNonTerminalProvisionJob(ctx, r.mgr.GetLocalManager().GetAPIReader(), client.ObjectKeyFromObject(instance), &v1alpha1.ComputeInstance{})
-		},
-		func() error {
-			return r.updateStatusWithRetry(ctx, client.ObjectKeyFromObject(instance), instance.Status)
-		},
-	)
+		})
+	}
 }
 
 // handleDeprovisioning manages the deprovisioning job lifecycle for a ComputeInstance.
@@ -509,14 +515,15 @@ func (r *ComputeInstanceReconciler) handleDeprovisioning(ctx context.Context, in
 	}
 }
 
-// resolveSubnetTargetNamespace looks up the Subnet CR referenced by spec.subnetRef
-// and returns the subnet target namespace (which equals the Subnet CR name).
-// Returns empty string if subnetRef is not set.
+// resolveSubnetNamespace looks up the Subnet CR referenced by the primary subnet
+// (spec.subnetRef or networkAttachments[0].subnetRef) and returns the subnet namespace
+// (which equals the Subnet CR name). Returns empty string if no primary subnet is set.
 // Returns error if Subnet CR lookup fails.
-func (r *ComputeInstanceReconciler) resolveSubnetTargetNamespace(ctx context.Context, instance *v1alpha1.ComputeInstance) (string, error) {
+func (r *ComputeInstanceReconciler) resolveSubnetNamespace(ctx context.Context, instance *v1alpha1.ComputeInstance) (string, error) {
 	log := ctrllog.FromContext(ctx)
 
-	if instance.Spec.SubnetRef == "" {
+	primarySubnetRef := instance.Spec.PrimarySubnetRef()
+	if primarySubnetRef == "" {
 		// No subnet reference, no namespace to resolve
 		return "", nil
 	}
@@ -524,68 +531,65 @@ func (r *ComputeInstanceReconciler) resolveSubnetTargetNamespace(ctx context.Con
 	// Look up Subnet CR in the same namespace as ComputeInstance
 	subnet := &v1alpha1.Subnet{}
 	subnetKey := types.NamespacedName{
-		Name:      instance.Spec.SubnetRef,
+		Name:      primarySubnetRef,
 		Namespace: instance.Namespace,
 	}
 
 	err := r.Get(ctx, subnetKey, subnet)
 	if err != nil {
-		return "", fmt.Errorf("failed to get Subnet CR %s: %w", instance.Spec.SubnetRef, err)
+		return "", fmt.Errorf("failed to get Subnet CR %s: %w", primarySubnetRef, err)
 	}
 
 	// Subnet namespace = Subnet CR name (established pattern from Phase 17)
-	subnetTargetNamespace := subnet.Name
+	subnetNamespace := subnet.Name
 
-	log.Info("Resolved subnet target namespace from Subnet CR",
-		"subnetRef", instance.Spec.SubnetRef,
-		"subnetTargetNamespace", subnetTargetNamespace,
+	log.Info("Resolved subnet namespace from Subnet CR",
+		"primarySubnetRef", primarySubnetRef,
+		"subnetNamespace", subnetNamespace,
 	)
 
-	return subnetTargetNamespace, nil
+	return subnetNamespace, nil
 }
 
-// syncSubnetTargetNamespaceAnnotation ensures the subnet-target-namespace annotation is set
-// when SubnetRef is configured. SubnetRef is immutable, so the annotation only
-// needs to be resolved and written once; subsequent reconciles reuse the cached
-// annotation value. Returns the resolved namespace, whether the annotation was
-// written, and any error.
-func (r *ComputeInstanceReconciler) syncSubnetTargetNamespaceAnnotation(ctx context.Context, instance *v1alpha1.ComputeInstance) (string, bool, error) {
-	if instance.Spec.SubnetRef == "" {
+// syncSubnetNamespaceAnnotation ensures the subnet-namespace annotation is set
+// when a primary subnet is configured (spec.subnetRef or networkAttachments[0].subnetRef).
+// That reference is treated as immutable in practice, so the annotation only needs to be
+// resolved and written once; subsequent reconciles reuse the cached annotation value.
+// Returns the resolved namespace, whether the annotation was written, and any error.
+func (r *ComputeInstanceReconciler) syncSubnetNamespaceAnnotation(ctx context.Context, instance *v1alpha1.ComputeInstance) (string, bool, error) {
+	if instance.Spec.PrimarySubnetRef() == "" {
 		return "", false, nil
 	}
 
-	// SubnetRef is immutable — if the annotation is already set, reuse it.
+	// Primary subnet is immutable — if the annotation is already set, reuse it.
 	if ns, ok := instance.Annotations[osacSubnetTargetNamespaceAnnotation]; ok {
 		return ns, false, nil
 	}
 
-	subnetTargetNamespace, err := r.resolveSubnetTargetNamespace(ctx, instance)
+	subnetNamespace, err := r.resolveSubnetNamespace(ctx, instance)
 	if err != nil {
-		if apierrors.IsNotFound(err) {
-			return "", false, fmt.Errorf("%w: %w", errSubnetNotFound, err)
-		}
-		return "", false, err
+		return "", false, fmt.Errorf("%w: %w", errSubnetNotFound, err)
 	}
 	if instance.Annotations == nil {
 		instance.Annotations = make(map[string]string)
 	}
-	instance.Annotations[osacSubnetTargetNamespaceAnnotation] = subnetTargetNamespace
-	return subnetTargetNamespace, true, nil
+	instance.Annotations[osacSubnetTargetNamespaceAnnotation] = subnetNamespace
+	return subnetNamespace, true, nil
 }
 
-// syncMetadataPreflight ensures the finalizer is set and the subnet-target-namespace
-// annotation is in sync with the current SubnetRef.  It batches all metadata
+// syncMetadataPreflight ensures the finalizer is set and the subnet-namespace
+// annotation is in sync with the current primary subnet reference. It batches all metadata
 // changes into a single r.Update() call to avoid multiple round-trips and the
-// status-clobbering problem.  The resolved subnetTargetNamespace is returned so
+// status-clobbering problem.  The resolved subnetNamespace is returned so
 // callers can reuse it without a second resolveSubnetNamespace call.
 func (r *ComputeInstanceReconciler) syncMetadataPreflight(ctx context.Context, instance *v1alpha1.ComputeInstance) (string, error) {
 	log := ctrllog.FromContext(ctx)
 
 	metadataChanged := controllerutil.AddFinalizer(instance, osacComputeInstanceFinalizer)
 
-	subnetTargetNamespace, changed, err := r.syncSubnetTargetNamespaceAnnotation(ctx, instance)
+	subnetNamespace, changed, err := r.syncSubnetNamespaceAnnotation(ctx, instance)
 	if err != nil {
-		log.Error(err, "Failed to resolve subnet target namespace")
+		log.Error(err, "Failed to resolve subnet namespace")
 		return "", err
 	}
 	if changed {
@@ -596,21 +600,21 @@ func (r *ComputeInstanceReconciler) syncMetadataPreflight(ctx context.Context, i
 		if err := r.Update(ctx, instance); err != nil {
 			return "", err
 		}
-		// r.Update() returns the full server response via .Into(obj): the annotation
-		// we just wrote, the latest ResourceVersion, and the current server-side status
-		// are all present in instance after this call. No re-fetch is needed.
-		// A cache-based r.Get() here would race against the async watch stream and
-		// return a stale version that wipes the annotation from instance before it
-		// reaches the AAP/EDA payload in handleProvisioning.
+		// Re-fetch so we have the latest resourceVersion and status; Update() may not
+		// return the full status (status subresource is separate), and we need the
+		// latest version to avoid 409 conflicts on later status updates.
+		if err := r.Get(ctx, client.ObjectKeyFromObject(instance), instance); err != nil {
+			return "", err
+		}
 	}
 
-	return subnetTargetNamespace, nil
+	return subnetNamespace, nil
 }
 
 func (r *ComputeInstanceReconciler) handleUpdate(ctx context.Context, _ reconcile.Request, instance *v1alpha1.ComputeInstance) (ctrl.Result, error) {
 	log := ctrllog.FromContext(ctx)
 
-	subnetTargetNamespace, err := r.syncMetadataPreflight(ctx, instance)
+	subnetNamespace, err := r.syncMetadataPreflight(ctx, instance)
 	if err != nil {
 		if errors.Is(err, errSubnetNotFound) {
 			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
@@ -641,11 +645,7 @@ func (r *ComputeInstanceReconciler) handleUpdate(ctx context.Context, _ reconcil
 		if scCond := tenant.GetStatusCondition(v1alpha1.TenantConditionStorageClassReady); scCond != nil && scCond.Message != "" {
 			msg = fmt.Sprintf("%s. %s: %s", msg, scCond.Type, scCond.Message)
 		}
-		oldReason := conditionReason(instance, v1alpha1.ComputeInstanceConditionProvisioned)
-		instance.SetStatusCondition(v1alpha1.ComputeInstanceConditionProvisioned, metav1.ConditionFalse, msg, v1alpha1.ReasonTenantNotReady)
-		if oldReason != v1alpha1.ReasonTenantNotReady {
-			r.Recorder.Eventf(instance, nil, corev1.EventTypeNormal, eventReasonTenantNotReady, eventActionReconcile, "%s", msg)
-		}
+		instance.SetStatusCondition(v1alpha1.ComputeInstanceConditionProvisioned, metav1.ConditionFalse, msg, "TenantNotReady")
 		log.Info("tenant is not ready, requeueing", "tenant", tenant.GetName())
 		return ctrl.Result{RequeueAfter: defaultPreconditionRequeueInterval}, nil
 	}
@@ -655,15 +655,15 @@ func (r *ComputeInstanceReconciler) handleUpdate(ctx context.Context, _ reconcil
 		return ctrl.Result{}, err
 	}
 
-	// When a subnetRef is set, the VM is created in the subnet target namespace
-	// (by the AAP playbook), not in the tenant target namespace.  Reuse the
-	// value resolved by syncMetadataPreflight to avoid a redundant API call.
-	targetNamespace := tenant.Status.Namespace
-	if subnetTargetNamespace != "" {
-		targetNamespace = subnetTargetNamespace
+	// When a primary subnet is set (subnetRef or networkAttachments), the VM is created
+	// in the subnet namespace (by the AAP playbook), not in the tenant namespace.
+	// Reuse the value resolved by syncMetadataPreflight to avoid a redundant API call.
+	vmSearchNamespace := tenant.Status.Namespace
+	if subnetNamespace != "" {
+		vmSearchNamespace = subnetNamespace
 	}
 
-	kv, err := r.findKubeVirtVMs(ctx, targetClient, instance, targetNamespace)
+	kv, err := r.findKubeVirtVMs(ctx, targetClient, instance, vmSearchNamespace)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -676,7 +676,7 @@ func (r *ComputeInstanceReconciler) handleUpdate(ctx context.Context, _ reconcil
 	} else {
 		// No KubeVirt VM exists yet: infrastructure is being provisioned.
 		instance.Status.Phase = v1alpha1.ComputeInstancePhaseStarting
-		instance.SetStatusCondition(v1alpha1.ComputeInstanceConditionProvisioned, metav1.ConditionFalse, "VirtualMachine not yet created, waiting for provisioning", v1alpha1.ReasonWaitingForVM)
+		instance.SetStatusCondition(v1alpha1.ComputeInstanceConditionProvisioned, metav1.ConditionFalse, "", v1alpha1.ReasonAsExpected)
 		instance.SetStatusCondition(v1alpha1.ComputeInstanceConditionReady, metav1.ConditionFalse, "", v1alpha1.ReasonAsExpected)
 		instance.SetStatusCondition(v1alpha1.ComputeInstanceConditionRestartRequired, metav1.ConditionFalse, "", v1alpha1.ReasonAsExpected)
 	}
@@ -822,35 +822,19 @@ func (r *ComputeInstanceReconciler) handleKubeVirtVM(ctx context.Context, target
 	// While PrintableStatus="Provisioning", KubeVirt is still creating DataVolumes
 	// (storage not yet ready). For all other states the VM CR exists and both compute
 	// and storage are allocated or in an operational state.
-	oldProvisionedReason := conditionReason(instance, v1alpha1.ComputeInstanceConditionProvisioned)
 	if kv.Status.PrintableStatus == kubevirtv1.VirtualMachineStatusProvisioning {
-		msg := fmt.Sprintf("Creating DataVolumes for boot disk (%dGiB)", instance.Spec.BootDisk.SizeGiB)
-		if len(instance.Spec.AdditionalDisks) > 0 {
-			msg = fmt.Sprintf("%s and %d additional disk(s)", msg, len(instance.Spec.AdditionalDisks))
-		}
-		instance.SetStatusCondition(v1alpha1.ComputeInstanceConditionProvisioned, metav1.ConditionFalse, msg, v1alpha1.ReasonProvisioningStorage)
-		if oldProvisionedReason != v1alpha1.ReasonProvisioningStorage {
-			r.Recorder.Eventf(instance, nil, corev1.EventTypeNormal, eventReasonProvisioningStorage, eventActionReconcile, "%s", msg)
-		}
+		instance.SetStatusCondition(v1alpha1.ComputeInstanceConditionProvisioned, metav1.ConditionFalse, "Provisioning infrastructure resources", v1alpha1.ReasonAsExpected)
 	} else {
-		instance.SetStatusCondition(v1alpha1.ComputeInstanceConditionProvisioned, metav1.ConditionTrue, "All infrastructure resources provisioned successfully", v1alpha1.ReasonInfrastructureReady)
-		if oldProvisionedReason != v1alpha1.ReasonInfrastructureReady {
-			r.Recorder.Eventf(instance, nil, corev1.EventTypeNormal, eventReasonInfrastructureReady, eventActionReconcile, "All infrastructure resources provisioned successfully")
-		}
+		instance.SetStatusCondition(v1alpha1.ComputeInstanceConditionProvisioned, metav1.ConditionTrue, "", v1alpha1.ReasonAsExpected)
 	}
 
-	// Ready mirrors VirtualMachine.Status.Ready, synced from the VirtualMachineInstance
-	// Ready condition (set by the virt-launcher pod's readiness probe).
-	oldReadyStatus := conditionStatus(instance, v1alpha1.ComputeInstanceConditionReady)
+	// Ready mirrors KubeVirt VirtualMachine.Status.Ready (virt-launcher readiness probe).
 	if kvVMHasConditionWithStatus(kv, kubevirtv1.VirtualMachineReady, corev1.ConditionTrue) {
 		ipAddress := r.getFirstVMIIPAddress(ctx, targetClient, kv.GetNamespace(), name)
 
 		log.Info("KubeVirt virtual machine (kubevirt resource) is ready", "computeinstance", instance.GetName(), "ipAddress", ipAddress)
 		instance.SetStatusCondition(v1alpha1.ComputeInstanceConditionReady, metav1.ConditionTrue, "", v1alpha1.ReasonAsExpected)
 		instance.SetIPAddress(ipAddress)
-		if oldReadyStatus != metav1.ConditionTrue {
-			r.Recorder.Eventf(instance, nil, corev1.EventTypeNormal, eventReasonReady, eventActionReconcile, "VirtualMachine is ready, IP: %s", ipAddress)
-		}
 	} else {
 		instance.SetStatusCondition(v1alpha1.ComputeInstanceConditionReady, metav1.ConditionFalse, "", v1alpha1.ReasonAsExpected)
 	}
@@ -975,6 +959,11 @@ func determinePhaseFromPrintableStatus(ctx context.Context, kv *kubevirtv1.Virtu
 	}
 }
 
+// shouldTriggerProvision determines the next provisioning action.
+// Returns provisioning.Poll with the in-progress job when one is already running.
+// Returns provisioning.Skip when config versions match (no change needed).
+// Returns provisioning.Requeue when the API server has a non-terminal job that the cache missed (stale cache).
+// Returns provisioning.Trigger when provisioning is needed and no in-flight job exists.
 func (r *ComputeInstanceReconciler) provisionState(instance *v1alpha1.ComputeInstance) *provisioning.State {
 	return &provisioning.State{
 		Jobs:                 &instance.Status.Jobs,
@@ -982,7 +971,12 @@ func (r *ComputeInstanceReconciler) provisionState(instance *v1alpha1.ComputeIns
 	}
 }
 
-// handleDesiredConfigVersion sets status.desiredConfigVersion to the hash of spec.
+func (r *ComputeInstanceReconciler) shouldTriggerProvision(ctx context.Context, instance *v1alpha1.ComputeInstance) (provisioning.Action, *v1alpha1.JobStatus) {
+	return provisioning.EvaluateAction(r.provisionState(instance), func() bool {
+		return provisioning.CheckAPIServerForNonTerminalProvisionJob(ctx, r.mgr.GetLocalManager().GetAPIReader(), client.ObjectKeyFromObject(instance), &v1alpha1.ComputeInstance{})
+	})
+}
+
 func (r *ComputeInstanceReconciler) handleDesiredConfigVersion(ctx context.Context, instance *v1alpha1.ComputeInstance) error {
 	version, err := provisioning.ComputeDesiredConfigVersion(instance.Spec)
 	if err != nil {
@@ -990,20 +984,4 @@ func (r *ComputeInstanceReconciler) handleDesiredConfigVersion(ctx context.Conte
 	}
 	instance.Status.DesiredConfigVersion = version
 	return nil
-}
-
-func conditionReason(instance *v1alpha1.ComputeInstance, condType v1alpha1.ComputeInstanceConditionType) string {
-	cond := instance.GetStatusCondition(condType)
-	if cond == nil {
-		return ""
-	}
-	return cond.Reason
-}
-
-func conditionStatus(instance *v1alpha1.ComputeInstance, condType v1alpha1.ComputeInstanceConditionType) metav1.ConditionStatus {
-	cond := instance.GetStatusCondition(condType)
-	if cond == nil {
-		return metav1.ConditionUnknown
-	}
-	return cond.Status
 }
