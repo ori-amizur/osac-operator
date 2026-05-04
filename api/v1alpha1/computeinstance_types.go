@@ -80,7 +80,7 @@ type NetworkAttachment struct {
 
 // ComputeInstanceSpec defines the desired state of ComputeInstance
 //
-// +kubebuilder:validation:XValidation:rule="!(size(self.networkAttachments) > 0 && self.subnetRef != \"\")",message="subnetRef must be empty when networkAttachments is set"
+// +kubebuilder:validation:XValidation:rule="!(size(self.networkAttachments) > 0 && has(self.subnetRef) && self.subnetRef != \"\")",message="subnetRef must be empty when networkAttachments is set"
 type ComputeInstanceSpec struct {
 	// TemplateID is the unique identifier of the compute instance template to use when creating this compute instance
 	// +kubebuilder:validation:Required
