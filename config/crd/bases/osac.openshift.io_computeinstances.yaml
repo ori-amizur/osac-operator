@@ -32,8 +32,8 @@ spec:
     - jsonPath: .status.phase
       name: Phase
       type: string
-    - jsonPath: .status.ipAddress
-      name: IP
+    - jsonPath: .status.ipAddresses
+      name: IPs
       type: string
     name: v1alpha1
     schema:
@@ -295,11 +295,14 @@ spec:
                 description: DesiredConfigVersion is the version (hash) of the desired
                   configuration of the ComputeInstance
                 type: string
-              ipAddress:
+              ipAddresses:
                 description: |-
-                  IPAddress is the primary IP address of the running instance, taken from the KubeVirt VirtualMachineInstance.
+                  IPAddresses lists all IP addresses assigned to the VM's network interfaces, taken from the KubeVirt VirtualMachineInstance.
                   Populated when the instance is ready (phase Running).
-                type: string
+                  The first entry corresponds to the primary network interface.
+                items:
+                  type: string
+                type: array
               jobs:
                 description: |-
                   Jobs tracks the history of provision and deprovision operations

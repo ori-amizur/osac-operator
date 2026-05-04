@@ -830,11 +830,11 @@ func (r *ComputeInstanceReconciler) handleKubeVirtVM(ctx context.Context, target
 
 	// Ready mirrors KubeVirt VirtualMachine.Status.Ready (virt-launcher readiness probe).
 	if kvVMHasConditionWithStatus(kv, kubevirtv1.VirtualMachineReady, corev1.ConditionTrue) {
-		ipAddress := r.getFirstVMIIPAddress(ctx, targetClient, kv.GetNamespace(), name)
+		ipAddresses := r.getAllVMIIPAddresses(ctx, targetClient, kv.GetNamespace(), name)
 
-		log.Info("KubeVirt virtual machine (kubevirt resource) is ready", "computeinstance", instance.GetName(), "ipAddress", ipAddress)
+		log.Info("KubeVirt virtual machine (kubevirt resource) is ready", "computeinstance", instance.GetName(), "ipAddresses", ipAddresses)
 		instance.SetStatusCondition(v1alpha1.ComputeInstanceConditionReady, metav1.ConditionTrue, "", v1alpha1.ReasonAsExpected)
-		instance.SetIPAddress(ipAddress)
+		instance.SetIPAddresses(ipAddresses)
 	} else {
 		instance.SetStatusCondition(v1alpha1.ComputeInstanceConditionReady, metav1.ConditionFalse, "", v1alpha1.ReasonAsExpected)
 	}
@@ -868,6 +868,31 @@ func (r *ComputeInstanceReconciler) getFirstVMIIPAddress(ctx context.Context, ta
 
 	log.Info("no IP address found for VirtualMachineInstance", "namespace", namespace, "name", name)
 	return ""
+}
+
+// getAllVMIIPAddresses fetches the VirtualMachineInstance and returns all non-empty
+// IP from .status.interfaces[*].ipAddress, or empty slice if none or on error.
+func (r *ComputeInstanceReconciler) getAllVMIIPAddresses(ctx context.Context, targetClient client.Client, namespace, name string) []string {
+	log := ctrllog.FromContext(ctx)
+
+	vmi := &kubevirtv1.VirtualMachineInstance{}
+	if err := targetClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, vmi); err != nil {
+		log.Error(err, "failed to get VirtualMachineInstance", "namespace", namespace, "name", name)
+		return nil
+	}
+
+	var ips []string
+	for _, iface := range vmi.Status.Interfaces {
+		if iface.IP != "" {
+			ips = append(ips, iface.IP)
+		}
+	}
+
+	if len(ips) == 0 {
+		log.Info("no IP addresses found for VirtualMachineInstance", "namespace", namespace, "name", name)
+	}
+
+	return ips
 }
 
 func kvVMGetCondition(vm *kubevirtv1.VirtualMachine, cond kubevirtv1.VirtualMachineConditionType) *kubevirtv1.VirtualMachineCondition {
