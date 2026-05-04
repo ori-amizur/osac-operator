@@ -949,7 +949,7 @@ var _ = Describe("ComputeInstanceFeedbackReconciler", func() {
 		It("should sync internal IP from CR status when no floating IP annotation", func() {
 			computeInstance := &osacv1alpha1.ComputeInstance{}
 			Expect(k8sClient.Get(ctx, typeNamespacedName, computeInstance)).To(Succeed())
-			computeInstance.Status.IPAddresses = []string{"192.168.1.50"}
+			computeInstance.Status.IPAddress = "192.168.1.50"
 			Expect(k8sClient.Status().Update(ctx, computeInstance)).To(Succeed())
 
 			_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
@@ -967,7 +967,7 @@ var _ = Describe("ComputeInstanceFeedbackReconciler", func() {
 			Expect(k8sClient.Update(ctx, computeInstance)).To(Succeed())
 
 			Expect(k8sClient.Get(ctx, typeNamespacedName, computeInstance)).To(Succeed())
-			computeInstance.Status.IPAddresses = []string{"192.168.1.50"}
+			computeInstance.Status.IPAddress = "192.168.1.50"
 			Expect(k8sClient.Status().Update(ctx, computeInstance)).To(Succeed())
 
 			_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})

@@ -295,6 +295,11 @@ spec:
                 description: DesiredConfigVersion is the version (hash) of the desired
                   configuration of the ComputeInstance
                 type: string
+              ipAddress:
+                description: |-
+                  IPAddress is the primary IP address of the running instance (first entry from ipAddresses).
+                  Deprecated: Use ipAddresses for multi-interface VMs. Kept for backward compatibility.
+                type: string
               ipAddresses:
                 description: |-
                   IPAddresses lists all IP addresses assigned to the VM's network interfaces, taken from the KubeVirt VirtualMachineInstance.

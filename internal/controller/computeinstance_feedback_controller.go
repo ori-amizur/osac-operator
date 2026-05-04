@@ -415,8 +415,8 @@ func (t *computeInstanceFeedbackReconcilerTask) syncIPAddress() {
 		return
 	}
 	// Fall back to the VM's internal IP from CR status
-	if len(t.object.Status.IPAddresses) > 0 && t.object.Status.IPAddresses[0] != "" {
-		t.ci.GetStatus().SetIpAddress(t.object.Status.IPAddresses[0])
+	if t.object.Status.IPAddress != "" {
+		t.ci.GetStatus().SetIpAddress(t.object.Status.IPAddress)
 	}
 }
 

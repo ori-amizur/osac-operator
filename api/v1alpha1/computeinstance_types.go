@@ -276,6 +276,11 @@ type ComputeInstanceStatus struct {
 	// The first entry corresponds to the primary network interface.
 	// +kubebuilder:validation:Optional
 	IPAddresses []string `json:"ipAddresses,omitempty"`
+
+	// IPAddress is the primary IP address of the running instance (first entry from ipAddresses).
+	// Deprecated: Use ipAddresses for multi-interface VMs. Kept for backward compatibility.
+	// +kubebuilder:validation:Optional
+	IPAddress string `json:"ipAddress,omitempty"`
 }
 
 // +kubebuilder:object:root=true

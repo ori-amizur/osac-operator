@@ -62,8 +62,28 @@ func (ci *ComputeInstance) GetTenantReferenceNamespace() string {
 
 func (ci *ComputeInstance) SetIPAddresses(ips []string) {
 	ci.Status.IPAddresses = ips
+	// Also set ipAddress for backward compatibility
+	if len(ips) > 0 {
+		ci.Status.IPAddress = ips[0]
+	} else {
+		ci.Status.IPAddress = ""
+	}
 }
 
 func (ci *ComputeInstance) GetIPAddresses() []string {
 	return ci.Status.IPAddresses
+}
+
+func (ci *ComputeInstance) SetIPAddress(ip string) {
+	ci.Status.IPAddress = ip
+	// Also populate ipAddresses for consistency
+	if ip != "" {
+		ci.Status.IPAddresses = []string{ip}
+	} else {
+		ci.Status.IPAddresses = nil
+	}
+}
+
+func (ci *ComputeInstance) GetIPAddress() string {
+	return ci.Status.IPAddress
 }
