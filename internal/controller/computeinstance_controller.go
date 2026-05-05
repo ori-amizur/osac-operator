@@ -18,11 +18,14 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
 
+	netattachdefv1 "github.com/k8snetworkplumbingwg/network-attachment-definition-client/pkg/apis/k8s.cni.cncf.io/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -663,6 +666,14 @@ func (r *ComputeInstanceReconciler) handleUpdate(ctx context.Context, _ reconcil
 		vmSearchNamespace = subnetNamespace
 	}
 
+	// Sync multi-NIC NetworkAttachmentDefinitions if needed
+	if subnetNamespace != "" {
+		if err := r.syncMultiNICNetworkAttachmentDefinitions(ctx, targetClient, instance, subnetNamespace); err != nil {
+			log.Error(err, "Failed to sync multi-NIC NetworkAttachmentDefinitions")
+			return ctrl.Result{}, err
+		}
+	}
+
 	kv, err := r.findKubeVirtVMs(ctx, targetClient, instance, vmSearchNamespace)
 	if err != nil {
 		return ctrl.Result{}, err
@@ -1009,4 +1020,119 @@ func (r *ComputeInstanceReconciler) handleDesiredConfigVersion(ctx context.Conte
 	}
 	instance.Status.DesiredConfigVersion = version
 	return nil
+}
+// syncMultiNICNetworkAttachmentDefinitions creates NADs in the VM's namespace
+// for secondary subnets when networkAttachments has multiple entries.
+// This allows the VM to attach to networks from other subnet namespaces
+// without violating Multus namespace isolation.
+func (r *ComputeInstanceReconciler) syncMultiNICNetworkAttachmentDefinitions(
+	ctx context.Context,
+	targetClient client.Client,
+	instance *v1alpha1.ComputeInstance,
+	targetNamespace string,
+) error {
+	log := ctrllog.FromContext(ctx)
+
+	// Only process if we have multiple network attachments
+	if len(instance.Spec.NetworkAttachments) <= 1 {
+		return nil
+	}
+
+	// Skip the first subnet (it already has a NAD in its own namespace)
+	// Create NADs for subnets 2, 3, etc.
+	for i := 1; i < len(instance.Spec.NetworkAttachments); i++ {
+		subnetRef := instance.Spec.NetworkAttachments[i].SubnetRef
+
+		// Look up the Subnet CR to get network configuration
+		subnet := &v1alpha1.Subnet{}
+		if err := r.Get(ctx, types.NamespacedName{
+			Name:      subnetRef,
+			Namespace: instance.Namespace,
+		}, subnet); err != nil {
+			return fmt.Errorf("failed to get subnet %s: %w", subnetRef, err)
+		}
+
+		// Get the source NAD from the subnet's namespace to copy its config
+		sourceNAD := &netattachdefv1.NetworkAttachmentDefinition{}
+		if err := targetClient.Get(ctx, types.NamespacedName{
+			Name:      subnet.Name,
+			Namespace: subnet.Name, // Subnet namespace = subnet name
+		}, sourceNAD); err != nil {
+			return fmt.Errorf("failed to get source NAD %s/%s: %w",
+				subnet.Name, subnet.Name, err)
+		}
+
+		// Create NAD in VM's namespace with config from source NAD
+		targetNAD := &netattachdefv1.NetworkAttachmentDefinition{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      subnet.Name,
+				Namespace: targetNamespace,
+				Labels: map[string]string{
+					"osac.io/multi-nic":        "true",
+					"osac.io/source-namespace": subnet.Name,
+					"osac.io/computeinstance":  instance.Name,
+				},
+			},
+			Spec: netattachdefv1.NetworkAttachmentDefinitionSpec{
+				Config: updateNADConfig(sourceNAD.Spec.Config, targetNamespace, subnet.Name),
+			},
+		}
+
+		// Create or update the NAD
+		existing := &netattachdefv1.NetworkAttachmentDefinition{}
+		err := targetClient.Get(ctx, types.NamespacedName{
+			Name:      targetNAD.Name,
+			Namespace: targetNAD.Namespace,
+		}, existing)
+
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				log.Info("Creating multi-NIC NAD",
+					"namespace", targetNamespace,
+					"name", subnet.Name,
+					"sourceSubnet", subnet.Name)
+				if err := targetClient.Create(ctx, targetNAD); err != nil {
+					return fmt.Errorf("failed to create NAD: %w", err)
+				}
+			} else {
+				return err
+			}
+		} else {
+			// NAD exists, update if config changed
+			if existing.Spec.Config != targetNAD.Spec.Config {
+				log.Info("Updating multi-NIC NAD",
+					"namespace", targetNamespace,
+					"name", subnet.Name)
+				existing.Spec.Config = targetNAD.Spec.Config
+				existing.Labels = targetNAD.Labels
+				if err := targetClient.Update(ctx, existing); err != nil {
+					return fmt.Errorf("failed to update NAD: %w", err)
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+// updateNADConfig updates the NAD config to reflect the new namespace and role
+func updateNADConfig(configJSON, targetNamespace, subnetName string) string {
+	var config map[string]interface{}
+	if err := json.Unmarshal([]byte(configJSON), &config); err != nil {
+		// Return original if unmarshal fails
+		return configJSON
+	}
+
+	// Update netAttachDefName to reflect the new namespace
+	config["netAttachDefName"] = fmt.Sprintf("%s/%s", targetNamespace, subnetName)
+
+	// Change role to secondary for non-primary NICs
+	config["role"] = "secondary"
+
+	updated, err := json.Marshal(config)
+	if err != nil {
+		// Return original if marshal fails
+		return configJSON
+	}
+	return string(updated)
 }
