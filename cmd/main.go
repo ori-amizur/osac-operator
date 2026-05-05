@@ -45,6 +45,7 @@ import (
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/clientcmd"
 	kubevirtv1 "kubevirt.io/api/core/v1"
+	netattachdefv1 "github.com/k8snetworkplumbingwg/network-attachment-definition-client/pkg/apis/k8s.cni.cncf.io/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	cluster "sigs.k8s.io/controller-runtime/pkg/cluster"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
@@ -166,6 +167,7 @@ func addSchemesForLocalControllers(
 	}
 	if enableComputeInstance {
 		utilruntime.Must(kubevirtv1.AddToScheme(localScheme))
+		utilruntime.Must(netattachdefv1.AddToScheme(localScheme))
 	}
 	if enableTenant {
 		utilruntime.Must(ovnv1.AddToScheme(localScheme))
@@ -186,6 +188,7 @@ func addSchemesForRemoteControllers(
 	utilruntime.Must(clientgoscheme.AddToScheme(remoteScheme))
 	if enableComputeInstance {
 		utilruntime.Must(kubevirtv1.AddToScheme(remoteScheme))
+		utilruntime.Must(netattachdefv1.AddToScheme(remoteScheme))
 	}
 	if enableTenant {
 		utilruntime.Must(ovnv1.AddToScheme(remoteScheme))

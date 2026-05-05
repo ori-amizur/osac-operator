@@ -122,6 +122,7 @@ func NewComputeInstanceReconciler(
 // +kubebuilder:rbac:groups=osac.openshift.io,resources=computeinstances/finalizers,verbs=update
 // +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=kubevirt.io,resources=virtualmachines;virtualmachineinstances,verbs=get;list;watch;delete
+// +kubebuilder:rbac:groups=k8s.cni.cncf.io,resources=network-attachment-definitions,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -668,10 +669,14 @@ func (r *ComputeInstanceReconciler) handleUpdate(ctx context.Context, _ reconcil
 
 	// Sync multi-NIC NetworkAttachmentDefinitions if needed
 	if subnetNamespace != "" {
+		log.Info("About to sync multi-NIC NADs",
+			"subnetNamespace", subnetNamespace,
+			"networkAttachments", len(instance.Spec.NetworkAttachments))
 		if err := r.syncMultiNICNetworkAttachmentDefinitions(ctx, targetClient, instance, subnetNamespace); err != nil {
 			log.Error(err, "Failed to sync multi-NIC NetworkAttachmentDefinitions")
 			return ctrl.Result{}, err
 		}
+		log.Info("Completed sync multi-NIC NADs")
 	}
 
 	kv, err := r.findKubeVirtVMs(ctx, targetClient, instance, vmSearchNamespace)
@@ -1033,8 +1038,14 @@ func (r *ComputeInstanceReconciler) syncMultiNICNetworkAttachmentDefinitions(
 ) error {
 	log := ctrllog.FromContext(ctx)
 
+	log.Info("syncMultiNICNetworkAttachmentDefinitions called",
+		"networkAttachments", len(instance.Spec.NetworkAttachments),
+		"targetNamespace", targetNamespace)
+
 	// Only process if we have multiple network attachments
 	if len(instance.Spec.NetworkAttachments) <= 1 {
+		log.Info("Skipping NAD sync - not enough network attachments",
+			"count", len(instance.Spec.NetworkAttachments))
 		return nil
 	}
 
